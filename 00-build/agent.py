@@ -27,11 +27,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+from datetime import date
 from pathlib import Path
 
 from openai import OpenAI
 
+import gates
 import tools
 from critic import review
 from prompts import CORTEX_SYSTEM
@@ -102,39 +105,92 @@ class Bounds:
 
 
 OUTPUT_DIR = Path(__file__).parent / "run-output"
+BUILD_LOG = OUTPUT_DIR / "build-log.jsonl"
+
+# The three exits from the Loop Spec, section 3. SUCCESS and ESCALATE both land in my
+# review queue (an escalate is a decision request); STUCK goes to a build log, because
+# it means Cortex failed mechanically, which is a bug for me to fix, not a call to make.
+OUTCOMES = {
+    "success": "FINAL STATUS UPDATE (draft, all gates passed, NOT posted)",
+    "escalate": "ESCALATED, decision request for a human (draft held, NOT posted)",
+    "stuck": "STUCK, halted and logged as a build problem (nothing for me to decide)",
+}
 
 
 def banner(text: str) -> None:
     print(f"\n{'=' * 64}\n{text}\n{'=' * 64}")
 
 
-def emit_deliverable(which: str, draft: str, *, accepted: bool,
-                     reason: str, cost: float) -> None:
-    """Surface AND persist Cortex's drafted status update so it can't get lost in
-    the scroll-back. This is still a DRAFT held for human review, never a post,
-    there is no publish tool, and an escalated run is held on purpose.
+def subject_project(brief: str) -> str | None:
+    """The project this run is ABOUT, read from the task brief.
 
-    Runs on every exit: an accepted pass prints the FINAL update; a bound trip or
-    escalation prints the LAST draft it managed to write plus why it was held.
+    Deliberately not inferred from which tools the agent happened to call: when a project
+    didn't exist, Cortex swept get_project/get_activity across every other project while
+    hunting for it, and the last successful call won. That mislabelled a build-log entry
+    and, worse, keyed the output file to a project the run was never about, overwriting a
+    good draft. The brief is the only authoritative source of the subject.
     """
-    banner("FINAL STATUS UPDATE (draft, validator-approved, NOT posted)" if accepted
-           else "LAST DRAFT (held, NOT posted, escalated to a human)")
+    match = re.search(r"\bP-[A-Z][A-Z0-9]+\b", brief)
+    return match.group(0) if match else None
+
+
+def run_key(which: str, project_id: str | None) -> str:
+    """Idempotency key from the Loop Spec, section 1. A cron run keys on project + ISO
+    week, so firing twice in the same week UPDATES that week's draft in place instead of
+    creating a second one. Falls back to the fixture name when no project resolved.
+    """
+    if project_id:
+        year, week, _ = date.today().isocalendar()
+        return f"{project_id}-{year}-W{week:02d}"
+    return f"task-{which}"
+
+
+def emit_deliverable(which: str, draft: str, *, outcome: str, reason: str, cost: float,
+                     project_id: str | None = None, notes=None) -> None:
+    """Surface AND persist the run's exit so it can't get lost in the scroll-back.
+
+    Every exit produces a DRAFT held for human review, never a post, there is no publish
+    tool. The three outcomes go to different places on purpose (see OUTCOMES above).
+    """
+    banner(OUTCOMES[outcome])
     if draft.strip():
         print(draft.rstrip())
     else:
         print("(Cortex stopped before it produced a draft, nothing to show.)")
-    if not accepted:
-        print(f"\nWhy it was held: {reason}")
+    if outcome != "success":
+        print(f"\nWhy: {reason}")
+    if notes:
+        print("\nCritic's advisory notes (judgment only, did NOT block this run):")
+        for note in notes:
+            print(f"  - {note}")
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    key = run_key(which, project_id)
+
+    if outcome == "stuck":
+        with BUILD_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"run_key": key, "fixture": which,
+                                     "outcome": outcome, "reason": reason,
+                                     "cost_usd": round(cost, 4)}) + "\n")
+        print(f"\nLogged build problem -> {BUILD_LOG.relative_to(Path(__file__).parent)}"
+              "  (no decision needed from me, go look at the code)")
 
     if draft.strip():
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        out = OUTPUT_DIR / f"status-update-{which}.md"
-        state = "accepted by validator" if accepted else "HELD, escalated"
-        out.write_text(
-            f"<!-- Cortex draft, {state}; NOT posted. Run cost ~ ${cost:.4f}. -->\n"
-            f"<!-- {reason} -->\n\n{draft.rstrip()}\n", encoding="utf-8")
-        print(f"\nSaved draft -> {out.relative_to(Path(__file__).parent)}  "
-              f"(for your review, nothing was posted)")
+        out = OUTPUT_DIR / f"{key}.md"
+        existed = out.exists()
+        state = {"success": "all gates passed, queued for review",
+                 "escalate": "HELD, escalated as a decision request",
+                 "stuck": "HELD, run halted as STUCK"}[outcome]
+        header = [f"<!-- Cortex draft, {state}; NOT posted. Run cost ~ ${cost:.4f}. -->",
+                  f"<!-- run key: {key} -->",
+                  f"<!-- {reason} -->"]
+        if notes:
+            header.append("<!-- critic advisory, non-blocking: "
+                          + " | ".join(str(n) for n in notes) + " -->")
+        out.write_text("\n".join(header) + f"\n\n{draft.rstrip()}\n", encoding="utf-8")
+        print(f"\n{'Updated existing' if existed else 'Saved new'} draft for run key "
+              f"{key} -> {out.relative_to(Path(__file__).parent)}  "
+              "(for your review, nothing was posted)")
 
 
 def run(which: str = "happy") -> None:
@@ -155,13 +211,16 @@ def run(which: str = "happy") -> None:
     source_log: list[str] = [task["body"]]
     revisions = 0
     last_draft = ""
+    project_id: str | None = subject_project(task["body"])
+    tool_errors = 0
+    print(f"\nSubject project (from the brief): {project_id or 'none named'}")
 
     for step in range(1, MAX_ITERATIONS + 1):
         if bounds.over_cap():
             reason = f"cost cap ${COST_CAP_USD} hit at ${bounds.cost:.4f}"
-            banner(f"BOUND TRIPPED, {reason}. Halting and escalating to a human.")
-            emit_deliverable(which, last_draft, accepted=False,
-                             reason=reason, cost=bounds.cost)
+            banner(f"BOUND TRIPPED, {reason}. Halting as STUCK.")
+            emit_deliverable(which, last_draft, outcome="stuck", reason=reason,
+                             cost=bounds.cost, project_id=project_id)
             return
 
         resp = client.chat.completions.create(
@@ -180,48 +239,104 @@ def run(which: str = "happy") -> None:
                 print(f"          -> {json.dumps(result)[:300]}")
                 messages.append({"role": "tool", "tool_call_id": call.id,
                                  "content": json.dumps(result)})
+                # Count broken reads. A rejected cap is NOT an error, it's a bound
+                # working as designed. (The subject project comes from the brief, not
+                # from here, see subject_project().)
+                if isinstance(result, dict) and "error" in result:
+                    tool_errors += 1
+
+            if tool_errors >= 3:
+                reason = (f"a tool returned an error {tool_errors}x; the data cannot be "
+                          "pulled, so this is a broken pipe, not a judgement call")
+                banner(f"STUCK, {reason}. Halting and logging as a build problem.")
+                emit_deliverable(which, last_draft, outcome="stuck", reason=reason,
+                                 cost=bounds.cost, project_id=project_id)
+                return
             continue
 
-        # No tool calls => Cortex produced a proposed output. Validate it.
+        # No tool calls => Cortex produced a proposed output. Gate it.
         proposed = msg.content or ""
         last_draft = proposed
         print(f"\n[step {step}] PROPOSED OUTPUT:\n{proposed}")
 
-        banner("CRITIC, independent validation")
+        # Cortex declining is a valid end state, but WHICH exit depends on why: a broken
+        # read is my bug (stuck), a call above the agent line is my decision (escalate).
+        # Search anywhere, not just position zero: Cortex often explains itself first and
+        # puts ESCALATE: on the last line. Matching only the start let one such run fall
+        # through to the gates and exit SUCCESS on a message that was a refusal.
+        if re.search(r"^\s*ESCALATE\b", proposed, re.I | re.M):
+            outcome = "stuck" if tool_errors else "escalate"
+            reason = ("Cortex escalated after a failed read, so the pipe is the problem"
+                      if tool_errors else "Cortex escalated a call that sits above the agent line")
+            banner(f"{outcome.upper()}, {reason}. Run cost ≈ ${bounds.cost:.4f}")
+            emit_deliverable(which, proposed, outcome=outcome, reason=reason,
+                             cost=bounds.cost, project_id=project_id)
+            return
+
+        # Tier 1: the deterministic gates. No model call, so they're free and they're
+        # facts, not opinions. These are what "done" means (Loop Spec section 2).
+        banner("DETERMINISTIC GATES (enforced in code, outside the model)")
+        results = gates.check_all(proposed, project_id, "\n".join(source_log))
+        for result in results:
+            print(f"  [{'PASS' if result['ok'] else 'FAIL'}] {result['gate']}: "
+                  f"{result['reason']}")
+        failures = [r for r in results if not r["ok"]]
+        above_line = [r for r in failures if r["agent_line"]]
+
+        if above_line:
+            reason = "above-the-line gate(s) failed: " + "; ".join(
+                f"{r['gate']} ({r['reason']})" for r in above_line)
+            banner(f"ESCALATE, {reason}. A human owns this call, no retry. "
+                   f"Run cost ≈ ${bounds.cost:.4f}")
+            emit_deliverable(which, proposed, outcome="escalate", reason=reason,
+                             cost=bounds.cost, project_id=project_id)
+            return
+
+        if failures:
+            if revisions >= MAX_REVISIONS:
+                reason = (f"fixable gate(s) still failing after {MAX_REVISIONS} "
+                          "revisions: " + ", ".join(r["gate"] for r in failures))
+                banner(f"STUCK, {reason}. Halting and logging as a build problem. "
+                       f"Run cost ≈ ${bounds.cost:.4f}")
+                emit_deliverable(which, proposed, outcome="stuck", reason=reason,
+                                 cost=bounds.cost, project_id=project_id)
+                return
+            revisions += 1
+            print(f"\n-> gates failed; revision {revisions}/{MAX_REVISIONS} "
+                  "(enough rope to self-correct, not enough to spiral)")
+            messages.append(msg)
+            messages.append({"role": "user", "content":
+                             "These deterministic gates failed: "
+                             + "; ".join(f"{r['gate']}: {r['reason']}" for r in failures)
+                             + ". Fix the draft. Do not argue with the gates, they are "
+                               "enforced outside you."})
+            continue
+
+        # Tier 2: the critic runs for JUDGMENT ONLY and cannot block done. It once failed
+        # a correct Green by inventing a rule the norms don't contain; its notes now ride
+        # along with the draft instead of vetoing it.
+        banner("CRITIC, advisory judgment (does NOT block done)")
         verdict = review(client, MODEL, proposed, "\n".join(source_log))
         # Estimate critic spend too.
         bounds.cost += (verdict["_usage"]["prompt"] * PRICE_IN
                         + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
         print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
+        notes = (["critic had no objections"] if verdict.get("verdict") == "pass"
+                 else list(verdict.get("reasons") or []))
 
-        if verdict["verdict"] == "pass":
-            banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
-                   f"your review. Nothing posted, no commitments made. "
-                   f"Run cost ≈ ${bounds.cost:.4f}")
-            emit_deliverable(which, proposed, accepted=True,
-                             reason="validator passed", cost=bounds.cost)
-            return
-
-        if revisions >= MAX_REVISIONS:
-            reason = f"validator rejected {MAX_REVISIONS}x (revision cap)"
-            banner(f"REVISION CAP hit ({MAX_REVISIONS}). Escalating to a human "
-                   f"instead of looping. Run cost ≈ ${bounds.cost:.4f}")
-            emit_deliverable(which, last_draft, accepted=False,
-                             reason=reason, cost=bounds.cost)
-            return
-
-        revisions += 1
-        print(f"\n-> critic rejected; revision {revisions}/{MAX_REVISIONS}")
-        messages.append(msg)
-        messages.append({"role": "user", "content":
-                         "A validator rejected that for these reasons: "
-                         f"{verdict['reasons']}. Fix it or escalate."})
+        banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
+               f"your review. Nothing posted, no commitments made. "
+               f"Run cost ≈ ${bounds.cost:.4f}")
+        emit_deliverable(which, proposed, outcome="success",
+                         reason="all deterministic gates passed",
+                         cost=bounds.cost, project_id=project_id, notes=notes)
+        return
 
     banner(f"MAX ITERATIONS ({MAX_ITERATIONS}) reached without finishing. "
-           f"Escalating. Run cost ≈ ${bounds.cost:.4f}")
-    emit_deliverable(which, last_draft, accepted=False,
+           f"Halting as STUCK. Run cost ≈ ${bounds.cost:.4f}")
+    emit_deliverable(which, last_draft, outcome="stuck",
                      reason=f"max iterations ({MAX_ITERATIONS}) reached",
-                     cost=bounds.cost)
+                     cost=bounds.cost, project_id=project_id)
 
 
 if __name__ == "__main__":
