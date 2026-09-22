@@ -11,7 +11,11 @@ from prompts import CRITIC_SYSTEM
 
 
 def review(client, model: str, proposed_output: str, source_data: str) -> dict:
-    """Return {"verdict": "pass"|"fail", "reasons": [...]} for a proposed output."""
+    """Return {"verdict": "pass"|"fail", "failed_rules": [...], "reasons": [...]}.
+
+    `failed_rules` carries the rule numbers from CRITIC_SYSTEM so `agent.py` can route
+    the consequence: rule 3 escalates with no retry, the rest revise under the shared cap.
+    """
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -26,6 +30,7 @@ def review(client, model: str, proposed_output: str, source_data: str) -> dict:
     try:
         verdict = json.loads(resp.choices[0].message.content)
     except (json.JSONDecodeError, TypeError):
-        verdict = {"verdict": "fail", "reasons": ["critic returned unparseable output"]}
+        verdict = {"verdict": "fail", "failed_rules": [],
+                   "reasons": ["critic returned unparseable output"]}
     verdict["_usage"] = {"prompt": usage.prompt_tokens, "completion": usage.completion_tokens}
     return verdict

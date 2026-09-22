@@ -160,7 +160,8 @@ def emit_deliverable(which: str, draft: str, *, outcome: str, reason: str, cost:
     if outcome != "success":
         print(f"\nWhy: {reason}")
     if notes:
-        print("\nCritic's advisory notes (judgment only, did NOT block this run):")
+        print("\nCritic findings (the 5 rules code cannot check; rule 3 escalates, "
+              "1/2/4/5 revise):")
         for note in notes:
             print(f"  - {note}")
 
@@ -185,7 +186,7 @@ def emit_deliverable(which: str, draft: str, *, outcome: str, reason: str, cost:
                   f"<!-- run key: {key} -->",
                   f"<!-- {reason} -->"]
         if notes:
-            header.append("<!-- critic advisory, non-blocking: "
+            header.append("<!-- critic findings: "
                           + " | ".join(str(n) for n in notes) + " -->")
         out.write_text("\n".join(header) + f"\n\n{draft.rstrip()}\n", encoding="utf-8")
         print(f"\n{'Updated existing' if existed else 'Saved new'} draft for run key "
@@ -312,17 +313,51 @@ def run(which: str = "happy") -> None:
                                "enforced outside you."})
             continue
 
-        # Tier 2: the critic runs for JUDGMENT ONLY and cannot block done. It once failed
-        # a correct Green by inventing a rule the norms don't contain; its notes now ride
-        # along with the draft instead of vetoing it.
-        banner("CRITIC, advisory judgment (does NOT block done)")
+        # Tier 2: the independent critic. It checks the five things code cannot (M3
+        # Field 5). Its verdict is REPORTED here and routed by the loop, the critic never
+        # decides the consequence, that's what let it escalate a correct Green in M2.
+        banner("CRITIC, independent validator (the 5 rules code cannot check)")
         verdict = review(client, MODEL, proposed, "\n".join(source_log))
         # Estimate critic spend too.
         bounds.cost += (verdict["_usage"]["prompt"] * PRICE_IN
                         + verdict["_usage"]["completion"] * PRICE_OUT) / 1_000_000
         print(json.dumps({k: v for k, v in verdict.items() if k != "_usage"}, indent=2))
-        notes = (["critic had no objections"] if verdict.get("verdict") == "pass"
-                 else list(verdict.get("reasons") or []))
+
+        critic_reasons = list(verdict.get("reasons") or [])
+        failed_rules = [int(n) for n in (verdict.get("failed_rules") or [])
+                        if str(n).isdigit()]
+
+        if verdict.get("verdict") == "fail":
+            if 3 in failed_rules:            # commitment is above my agent line (M1)
+                reason = ("critic rule 3, soft commitment on a launch the roadmap marks "
+                          "unconfirmed: " + "; ".join(critic_reasons))
+                banner(f"ESCALATE, {reason} A human owns commitment, no retry. "
+                       f"Run cost ≈ ${bounds.cost:.4f}")
+                emit_deliverable(which, proposed, outcome="escalate", reason=reason,
+                                 cost=bounds.cost, project_id=project_id,
+                                 notes=critic_reasons)
+                return
+            if revisions >= MAX_REVISIONS:   # shared counter with the gates, cap 2
+                reason = (f"critic rule(s) {failed_rules or 'unspecified'} still failing "
+                          f"after {MAX_REVISIONS} revisions: " + "; ".join(critic_reasons))
+                banner(f"ESCALATE, {reason} Gate state and critic reasons attached. "
+                       f"Run cost ≈ ${bounds.cost:.4f}")
+                emit_deliverable(which, proposed, outcome="escalate", reason=reason,
+                                 cost=bounds.cost, project_id=project_id,
+                                 notes=critic_reasons)
+                return
+            revisions += 1
+            print(f"\n-> critic failed rule(s) {failed_rules or 'unspecified'}; revision "
+                  f"{revisions}/{MAX_REVISIONS} (shared counter with the gates)")
+            messages.append(msg)
+            messages.append({"role": "user", "content":
+                             "An independent reviewer failed your draft: "
+                             + "; ".join(critic_reasons)
+                             + ". Fix exactly those points. Do not re-argue the "
+                               "deterministic gates, they already passed."})
+            continue
+
+        notes = critic_reasons or ["critic had no objections"]
 
         banner(f"HITL CHECKPOINT, status update + any proposed stories queued for "
                f"your review. Nothing posted, no commitments made. "
